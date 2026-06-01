@@ -163,6 +163,12 @@ model = AutoModelForCausalLM.from_pretrained(
     Output checkpoint dtype. The default paper setting is bf16.
 ```
 
+## Main Results
+
+<p align="center">
+  <img src="assets/main_results.png" width="850">
+</p>
+
 ## Evaluation
 
 The merged checkpoint can be evaluated as a normal HuggingFace causal language
