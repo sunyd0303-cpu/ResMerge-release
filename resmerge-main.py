@@ -203,47 +203,27 @@ def module_family(name: str) -> str:
 def tensor_mode_for_name(
     name: str,
     ndim: int,
-    embed_lm_head_mode: str,
-    norm_mode: str,
-    one_d_mode: str,
-    other_mode: str,
 ) -> str:
     if is_embedding_or_head_param(name):
-        return embed_lm_head_mode
+        return "ta"
     if is_norm_param(name):
-        return norm_mode
+        return "ta"
     if ndim == 1:
-        return one_d_mode
-    if module_family(name) == "other":
-        return other_mode
+        return "ta"
     return "resmerge"
 
 
-def apply_simple_merge(
+def apply_task_arithmetic_mean(
     base_weight: torch.Tensor,
     task_weights: List[torch.Tensor],
-    mode: str,
 ) -> torch.Tensor:
-    if mode == "base":
-        return base_weight.clone()
-
-    if mode in {"ta", "residual"}:
-        acc = torch.zeros_like(base_weight, dtype=MERGE_DTYPE, device="cpu")
-        inv_n = 1.0 / float(len(task_weights))
-        if mode == "ta":
-            for weight in task_weights:
-                acc.add_(weight.to(dtype=MERGE_DTYPE), alpha=inv_n)
-        else:
-            base_float = base_weight.to(dtype=MERGE_DTYPE, device="cpu")
-            for weight in task_weights:
-                acc.add_(weight.to(dtype=MERGE_DTYPE) - base_float, alpha=inv_n)
-            acc.add_(base_float)
-            del base_float
-        out = acc.to(dtype=base_weight.dtype)
-        del acc
-        return out
-
-    raise ValueError(f"Unsupported simple merge mode: {mode}")
+    acc = torch.zeros_like(base_weight, dtype=MERGE_DTYPE, device="cpu")
+    inv_n = 1.0 / float(len(task_weights))
+    for weight in task_weights:
+        acc.add_(weight.to(dtype=MERGE_DTYPE), alpha=inv_n)
+    out = acc.to(dtype=base_weight.dtype)
+    del acc
+    return out
 
 
 @torch.inference_mode()
@@ -296,12 +276,21 @@ def clamp01(value: float) -> float:
 
 
 @torch.inference_mode()
-def pairwise_cosine_stats(vectors: List[torch.Tensor]) -> Dict[str, float]:
+def frobenius_cosine(left: torch.Tensor, right: torch.Tensor, eps: float = 1e-8) -> float:
+    left_flat = left.reshape(-1)
+    right_flat = right.reshape(-1)
+    numerator = torch.dot(left_flat, right_flat)
+    denominator = left_flat.norm() * right_flat.norm() + eps
+    return float((numerator / denominator).item())
+
+
+@torch.inference_mode()
+def pairwise_cosine_stats(vectors: List[torch.Tensor], eps: float = 1e-8) -> Dict[str, float]:
     values: List[float] = []
     positives: List[float] = []
     for i in range(len(vectors)):
         for j in range(i + 1, len(vectors)):
-            value = float(torch.dot(vectors[i], vectors[j]).item())
+            value = frobenius_cosine(vectors[i], vectors[j], eps=eps)
             values.append(value)
             positives.append(max(0.0, value))
     if not values:
@@ -318,13 +307,6 @@ def build_src_a_residual(
     family: str,
     beta_min: float,
     beta_max: float,
-    norm_rule: str,
-    pair_threshold: float,
-    pair_ref: float,
-    coherence_ref: float,
-    attention_score_scale: float,
-    ffn_score_scale: float,
-    other_score_scale: float,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     num_experts = len(residuals)
@@ -339,57 +321,47 @@ def build_src_a_residual(
         return torch.zeros_like(residuals[0])
 
     q_list = [
-        residual.reshape(-1) / residual_norms[idx].clamp_min(eps)
+        residual.reshape(-1) / (residual_norms[idx] + eps)
         for idx, residual in enumerate(residuals)
     ]
-    pair_stats = pairwise_cosine_stats(q_list)
+    pair_stats = pairwise_cosine_stats(q_list, eps=eps)
 
-    q_bar = torch.zeros_like(q_list[0])
-    inv_n = 1.0 / float(num_experts)
+    q_sum = torch.zeros_like(q_list[0])
     for q_vec in q_list:
-        q_bar.add_(q_vec, alpha=inv_n)
+        q_sum.add_(q_vec)
 
-    coherence = float(q_bar.norm().item())
-    if coherence <= eps:
-        return torch.zeros_like(residuals[0])
+    q_sum_norm = float(q_sum.norm().item())
+    if q_sum_norm <= eps:
+        return mean_tensor(residuals)
+    q_src = q_sum / (q_sum_norm + eps)
+    coherence = clamp01(
+        sum(frobenius_cosine(q_vec, q_src, eps=eps) for q_vec in q_list) / float(num_experts)
+    )
 
-    random_coherence = 1.0 / math.sqrt(float(max(1, num_experts)))
-    pair_ref = max(float(pair_ref), float(pair_threshold) + eps)
-    pair_score = clamp01((float(pair_stats["mean"]) - float(pair_threshold)) / (pair_ref - float(pair_threshold)))
-    coherence_ref = max(float(coherence_ref), random_coherence + eps)
-    coherence_score = clamp01((coherence - random_coherence) / (coherence_ref - random_coherence))
-    score = 0.5 * (pair_score + coherence_score)
-
-    if family == "attention":
-        score *= float(attention_score_scale)
-    elif family == "ffn":
-        score *= float(ffn_score_scale)
-    else:
-        score *= float(other_score_scale)
-    score = clamp01(score)
+    # Paper definition: map s_R and c_R with (x + 1) / 2, then average.
+    s_bar = clamp01((float(pair_stats["mean"]) + 1.0) * 0.5)
+    c_bar = clamp01((coherence + 1.0) * 0.5)
+    family_scale = 1.0 if family in {"attention", "ffn"} else 0.0
+    score = clamp01(0.5 * (s_bar + c_bar) * family_scale)
 
     beta = float(beta_max) - (float(beta_max) - float(beta_min)) * score
 
-    if norm_rule == "mean":
-        target_norm = float(residual_norms.mean().item())
-    elif norm_rule == "geom":
-        target_norm = float(torch.exp(residual_norms.clamp_min(eps).log().mean()).item())
-    else:
-        raise ValueError(f"Unsupported residual norm rule: {norm_rule}")
+    target_norm = float(residual_norms.mean().item())
 
+    random_coherence = 1.0 / math.sqrt(float(max(1, num_experts)))
+    if coherence <= random_coherence:
+        return mean_tensor(residuals)
+
+    # c_R is already in [0, 1], so use the raw spherical coherence here.
     effective_norm = (coherence ** beta) * target_norm
-    return (q_bar / max(coherence, eps) * effective_norm).reshape(shape)
+    return (q_src * effective_norm).reshape(shape)
 
 
 @torch.inference_mode()
 def head_agreement(
     heads: List[torch.Tensor],
-    rule: str,
     eps: float = 1e-8,
 ) -> float:
-    if rule == "none":
-        return 1.0
-
     normalized_heads = []
     for head in heads:
         norm = float(head.norm().item())
@@ -399,11 +371,7 @@ def head_agreement(
         return 0.0
 
     stats = pairwise_cosine_stats(normalized_heads)
-    if rule == "mean":
-        return clamp01(max(0.0, stats["mean"]))
-    if rule == "pos_mean":
-        return clamp01(stats["pos_mean"])
-    raise ValueError(f"Unsupported head reliability rule: {rule}")
+    return clamp01(stats["pos_mean"])
 
 
 @torch.inference_mode()
@@ -413,22 +381,9 @@ def merge_one_tensor_resmerge(
     task_weights_cpu: List[torch.Tensor],
     rank_topk: int,
     device: torch.device,
-    src_scale: float,
     beta_min: float,
     beta_max: float,
-    norm_rule: str,
-    pair_threshold: float,
-    pair_ref: float,
-    coherence_ref: float,
-    attention_score_scale: float,
-    ffn_score_scale: float,
-    other_score_scale: float,
     head_ratio_budget: float,
-    head_reliability_rule: str,
-    embed_lm_head_mode: str,
-    norm_mode: str,
-    one_d_mode: str,
-    other_mode: str,
     svd_driver: Optional[str],
 ) -> torch.Tensor:
     if not torch.is_tensor(base_weight_cpu):
@@ -441,13 +396,9 @@ def merge_one_tensor_resmerge(
     mode = tensor_mode_for_name(
         name=name,
         ndim=base_weight_cpu.ndim,
-        embed_lm_head_mode=embed_lm_head_mode,
-        norm_mode=norm_mode,
-        one_d_mode=one_d_mode,
-        other_mode=other_mode,
     )
     if mode != "resmerge":
-        return apply_simple_merge(base_weight_cpu, task_weights_cpu, mode)
+        return apply_task_arithmetic_mean(base_weight_cpu, task_weights_cpu)
 
     base = base_weight_cpu.to(device=device, dtype=MERGE_DTYPE, non_blocking=False)
     task_weights = [weight.to(device=device, dtype=MERGE_DTYPE, non_blocking=False) for weight in task_weights_cpu]
@@ -465,18 +416,10 @@ def merge_one_tensor_resmerge(
         family=module_family(name),
         beta_min=beta_min,
         beta_max=beta_max,
-        norm_rule=norm_rule,
-        pair_threshold=pair_threshold,
-        pair_ref=pair_ref,
-        coherence_ref=coherence_ref,
-        attention_score_scale=attention_score_scale,
-        ffn_score_scale=ffn_score_scale,
-        other_score_scale=other_score_scale,
     )
-    residual_backbone = float(src_scale) * residual_backbone
 
     correction = torch.zeros_like(residual_backbone)
-    reliability = head_agreement(heads, rule=head_reliability_rule)
+    reliability = head_agreement(heads)
     budget = float(head_ratio_budget) * reliability
     anchor_norm = float(residual_backbone.norm().item())
     mean_head = mean_tensor(heads)
@@ -652,6 +595,16 @@ def copy_generation_config_if_exists(base_path: str, output_dir: str) -> None:
         shutil.copy2(src, dst)
 
 
+def maybe_add_tied_lm_head(state_dict: Dict[str, torch.Tensor], config: Any) -> None:
+    if (
+        getattr(config, "tie_word_embeddings", False)
+        and "lm_head.weight" not in state_dict
+        and "model.embed_tokens.weight" in state_dict
+    ):
+        state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+        print("[Save] Added tied lm_head.weight from model.embed_tokens.weight for strict load.")
+
+
 @torch.inference_mode()
 def save_merged_model_and_tokenizer(
     base_path: str,
@@ -673,6 +626,7 @@ def save_merged_model_and_tokenizer(
 
     print("[Save] Building model from config and loading merged weights ...")
     model = AutoModelForCausalLM.from_config(config, **model_kwargs)
+    maybe_add_tied_lm_head(merged_state_dict, config)
     load_result = model.load_state_dict(merged_state_dict, strict=True)
     if getattr(load_result, "missing_keys", None):
         raise RuntimeError(f"Missing keys while loading merged state dict: {load_result.missing_keys[:20]}")
@@ -719,23 +673,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry_cuda_oom", action="store_true")
 
     parser.add_argument("--rank_topk", type=int, default=1)
-    parser.add_argument("--src_scale", type=float, default=1.0)
     parser.add_argument("--src_beta_min", type=float, default=0.7)
     parser.add_argument("--src_beta_max", type=float, default=1.0)
-    parser.add_argument("--src_pair_threshold", type=float, default=0.03)
-    parser.add_argument("--src_pair_ref", type=float, default=0.05)
-    parser.add_argument("--src_coherence_ref", type=float, default=0.60)
-    parser.add_argument("--src_attention_score_scale", type=float, default=1.0)
-    parser.add_argument("--src_ffn_score_scale", type=float, default=0.25)
-    parser.add_argument("--src_other_score_scale", type=float, default=0.0)
-    parser.add_argument("--src_norm_rule", type=str, default="mean", choices=["mean", "geom"])
     parser.add_argument("--head_ratio_budget", type=float, default=0.20)
-    parser.add_argument("--head_reliability_rule", type=str, default="pos_mean", choices=["none", "pos_mean", "mean"])
-
-    parser.add_argument("--embed_lm_head_mode", "--src_embed_lm_head_mode", dest="embed_lm_head_mode", type=str, default="ta", choices=["base", "ta", "residual"])
-    parser.add_argument("--norm_mode", "--src_norm_mode", dest="norm_mode", type=str, default="ta", choices=["base", "ta", "residual"])
-    parser.add_argument("--one_d_mode", "--src_1d_mode", dest="one_d_mode", type=str, default="ta", choices=["base", "ta", "residual"])
-    parser.add_argument("--other_mode", "--src_other_mode", dest="other_mode", type=str, default="resmerge", choices=["resmerge", "base", "ta", "residual"])
 
     parser.add_argument("--save_dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--max_shard_size", type=str, default="5GB")
@@ -752,19 +692,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--src_beta_min and --src_beta_max must be >= 0")
     if args.src_beta_min > args.src_beta_max:
         raise ValueError("--src_beta_min must be <= --src_beta_max")
-    if args.src_pair_threshold < 0.0:
-        raise ValueError("--src_pair_threshold must be >= 0")
-    if args.src_pair_ref <= args.src_pair_threshold:
-        raise ValueError("--src_pair_ref must be > --src_pair_threshold")
-    if args.src_coherence_ref <= 0.0:
-        raise ValueError("--src_coherence_ref must be > 0")
-    if args.src_scale < 0.0:
-        raise ValueError("--src_scale must be >= 0")
     if args.head_ratio_budget < 0.0:
         raise ValueError("--head_ratio_budget must be >= 0")
-    for name in ("src_attention_score_scale", "src_ffn_score_scale", "src_other_score_scale"):
-        if getattr(args, name) < 0.0:
-            raise ValueError(f"--{name} must be >= 0")
 
 
 def main() -> None:
@@ -788,22 +717,9 @@ def main() -> None:
 
     args_dict: Dict[str, Any] = {
         "rank_topk": args.rank_topk,
-        "src_scale": args.src_scale,
         "beta_min": args.src_beta_min,
         "beta_max": args.src_beta_max,
-        "norm_rule": args.src_norm_rule,
-        "pair_threshold": args.src_pair_threshold,
-        "pair_ref": args.src_pair_ref,
-        "coherence_ref": args.src_coherence_ref,
-        "attention_score_scale": args.src_attention_score_scale,
-        "ffn_score_scale": args.src_ffn_score_scale,
-        "other_score_scale": args.src_other_score_scale,
         "head_ratio_budget": args.head_ratio_budget,
-        "head_reliability_rule": args.head_reliability_rule,
-        "embed_lm_head_mode": args.embed_lm_head_mode,
-        "norm_mode": args.norm_mode,
-        "one_d_mode": args.one_d_mode,
-        "other_mode": args.other_mode,
         "svd_driver": svd_driver,
         "verbose_every": args.verbose_every,
         "empty_cache_every": args.empty_cache_every,
@@ -821,9 +737,9 @@ def main() -> None:
     )
     print(
         f"beta=[{args.src_beta_min}, {args.src_beta_max}], "
-        f"family_scales(attn/ffn/other)="
-        f"{args.src_attention_score_scale}/{args.src_ffn_score_scale}/{args.src_other_score_scale}"
+        "family_scales(attn/ffn/other)=1.0/1.0/0.0 (fixed)"
     )
+    print("residual_mean_fallback: c_R <= 1/sqrt(num_experts)")
     print(f"device={args.device}, gpu_ids={gpu_ids if args.device == 'cuda' else 'N/A'}")
     print(f"save_dtype={save_dtype}, save_attn_implementation={args.save_attn_implementation}")
     print("=====================================")
