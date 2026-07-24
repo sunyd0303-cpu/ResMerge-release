@@ -13,9 +13,7 @@ This repository provides the main merging script:
 resmerge-main.py
 ```
 
-The script loads HuggingFace `safetensors` checkpoints in a streaming manner,
-supports single-GPU and multi-GPU tensor-level parallelism, and saves the merged
-model as a standard HuggingFace-compatible checkpoint.
+The script loads tensors from Hugging Face `safetensors` checkpoints on demand, avoiding the need to load all source checkpoints into memory simultaneously. It supports single-GPU execution and tensor-wise multi-GPU parallel merging, where each complete parameter tensor is assigned to and processed on a single GPU, and saves the merged model as a standard Hugging Face-compatible checkpoint.
 
 ## Method Overview
 
@@ -54,7 +52,7 @@ computes cross-expert head agreement `S_H` and injects only a lightweight
 correction:
 
 ```text
-C = rho * S_H * ||A|| * normalize(H_mean)
+C = rho * S_H * ||A||_F * normalize(H_mean)
 ```
 
 The final merged task vector is:
@@ -66,6 +64,20 @@ W_merge = W_0 + M
 
 For non-eligible tensors such as embeddings, `lm_head`, normalization tensors,
 and 1D parameters, the default behavior is task arithmetic.
+
+## Model Requirements
+
+- `--base_model` and every entry in `--task_models` must be local
+  Hugging Face causal language model directories.
+- Checkpoints must use `safetensors`, either as a single
+  `model.safetensors` file or as a sharded checkpoint with a
+  `model.safetensors.index.json` file.
+- The expert models must share the same architecture and base
+  initialization, with compatible parameter names, parameter shapes,
+  tokenizer, and vocabulary.
+- Adapter-only and quantized checkpoints are not currently supported.
+  LoRA adapters should first be merged into the base model and saved as
+  full `safetensors` checkpoints.
 
 ## Environment Setup
 
@@ -94,16 +106,12 @@ python resmerge-main.py \
   --output_dir /path/to/resmerge_output \
   --device cuda \
   --gpu_ids 0,1,2,3 \
-  --merge_impl stream \
   --rank_topk 1 \
-  --head_ratio_budget 0.20 \
-  --head_reliability_rule pos_mean \
-  --save_dtype bf16 \
-  --save_attn_implementation eager \
-  --retry_cuda_oom
+  --head_ratio_budget 0.2 \
+  --save_dtype bf16
 ```
 
-The output directory will contain a standard HuggingFace model checkpoint:
+Depending on model size and the files available in the base checkpoint, the output directory typically contains:
 
 ```text
 config.json
@@ -136,16 +144,16 @@ model = AutoModelForCausalLM.from_pretrained(
     Path to the shared base model.
 
 --task_models
-    Paths to expert models fine-tuned from the same base model.
+    Paths to compatible expert models derived from the same base model.
 
 --output_dir
-    Directory for the merged HuggingFace checkpoint.
+    Directory for the merged Hugging Face checkpoint.
 
 --device
     Use cuda or cpu. CUDA is recommended.
 
 --gpu_ids
-    Comma-separated GPU ids used for tensor-level parallel merging.
+    Comma-separated GPU IDs used for tensor-wise multi-GPU parallel merging.
 
 --rank_topk
     Number of leading singular components treated as the spectral head.
@@ -155,30 +163,61 @@ model = AutoModelForCausalLM.from_pretrained(
     The residual-relative head budget rho. It controls the maximum norm of the
     lightweight head correction relative to the SRC-A residual backbone.
 
---head_reliability_rule
-    Head agreement rule. `pos_mean` uses the positive mean pairwise cosine among
-    expert heads as the reliability gate.
-
 --save_dtype
     Output checkpoint dtype. The default paper setting is bf16.
 ```
 
 ## Main Results
 
+### Qwen2.5-7B-Base
+
 <p align="center">
-  <img src="assets/main_results.png" width="850">
+  <img src="assets/main_results_qwen2.5-7b.png" width="850">
 </p>
 
+### Qwen3-4B-Base
+
+<p align="center">
+  <img src="assets/main_results_qwen3-4b.png" width="850">
+</p>
 ## Evaluation
 
-The merged checkpoint can be evaluated as a normal HuggingFace causal language
-model. Following the evaluation setting used in
-[MRL](https://github.com/xiangchi-yuan/mrl), we use the following tools:
+The merged checkpoint can be evaluated as a standard Hugging Face causal
+language model. We use the following open-source evaluation frameworks:
 
-- **Tool using:** [Berkeley Function Calling Leaderboard (BFCL)](https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard).
-- **Memory:** we use [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent) to test long-context retention and retrieval capabilities.
-- **Math and coding:** [Evalchemy](https://github.com/mlfoundations/evalchemy) as the unified evaluation framework.
+- **Tool using:** We use
+  [BFCL V3](https://gorilla.cs.berkeley.edu/blogs/13_bfcl_v3_multi_turn.html)
+  with the
+  [official BFCL evaluation code](https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard).
+- **Memory:** We use [MemAgent](https://github.com/BytedTsinghua-SIA/MemAgent) to evaluate long-context retention and retrieval capabilities.
+- **Mathematics, coding, and general reasoning:** We use
+  [Evalchemy](https://github.com/mlfoundations/evalchemy) as the unified
+  evaluation framework.
 
-Please keep the same prompt templates, decoding settings, dataset versions, and
-sample counts when comparing the base model, expert models, baseline merging
-methods, and ResMerge.
+The benchmarks used in our experiments and links to their corresponding
+papers or official sources are listed below. Please keep the same prompt
+templates, decoding settings, dataset versions, and sample counts when
+comparing the base model, expert models, baseline merging methods, and
+ResMerge.
+
+### Benchmark References
+
+- **Mathematics**
+  - **AIME 2024:** [Dataset source](https://huggingface.co/datasets/di-zhang-fdu/AIME_1983_2024) | [Official MAA AIME page](https://maa.org/maa-invitational-competitions/)
+  - **AIME 2025:** [Dataset source](https://huggingface.co/datasets/TIGER-Lab/AIME25) | [Official MAA AIME page](https://maa.org/maa-invitational-competitions/)
+  - **AMC 2023:** [Dataset source](https://huggingface.co/datasets/AI-MO/aimo-validation-amc) | [Official MAA AMC page](https://maa.org/student-programs/amc/)
+  - **MATH-500:** [Paper](https://arxiv.org/abs/2305.20050) | [Dataset](https://huggingface.co/datasets/HuggingFaceH4/MATH-500)
+
+- **Coding**
+  - **LiveCodeBench (`release_v2`):** [Paper](https://arxiv.org/abs/2403.07974) | [Official repository](https://github.com/LiveCodeBench/LiveCodeBench)
+  - **HumanEvalPlus:** [EvalPlus paper](https://arxiv.org/abs/2305.01210) | [Dataset](https://huggingface.co/datasets/evalplus/humanevalplus) | [Official repository](https://github.com/evalplus/evalplus)
+  - **MBPPPlus:** [EvalPlus paper](https://arxiv.org/abs/2305.01210) | [Dataset](https://huggingface.co/datasets/evalplus/mbppplus) | [Official repository](https://github.com/evalplus/evalplus)
+
+- **General Reasoning**
+  - **GPQA-Diamond:** [Paper](https://arxiv.org/abs/2311.12022) | [Official dataset](https://huggingface.co/datasets/Idavidrein/gpqa)
+
+- **Tool Use**
+  - **BFCL V3:** [Official BFCL V3 page](https://gorilla.cs.berkeley.edu/blogs/13_bfcl_v3_multi_turn.html) | [Official evaluation code](https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard)
+- **Memory**
+  - **HotpotQA:** (`7K` and `14K` context settings)[Paper](https://aclanthology.org/D18-1259/) | [Official website](https://hotpotqa.github.io/)
+  - **SQuAD:** (`32K` context setting)[Paper](https://aclanthology.org/D16-1264/) | [Official website](https://rajpurkar.github.io/SQuAD-explorer/)
