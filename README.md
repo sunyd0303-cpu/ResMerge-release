@@ -180,6 +180,7 @@ model = AutoModelForCausalLM.from_pretrained(
 <p align="center">
   <img src="assets/main_results_qwen3-4b.png" width="850">
 </p>
+
 ## Evaluation
 
 The merged checkpoint can be evaluated as a standard Hugging Face causal
